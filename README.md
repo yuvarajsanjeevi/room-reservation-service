@@ -36,64 +36,95 @@ other: a payment landing right as the scheduler decides a booking is overdue.
 
 ---
 
-## Design & Implementation Decisions
+## Design Decisions & Assumptions
 
-The assignment leaves a lot of gaps, so here's what I decided and why.
+The assignment leaves a few areas open to interpretation. The following decisions were made to keep the implementation simple, configurable, and safe under normal production scenarios.
 
-* **Pricing.** Nothing in the spec says what a room costs, so I didn't overthink it -
-  `RoomPricingCalculator` looks up a nightly rate per `RoomSegment` from `application.yaml`
-  (`room-reservation.nightly-rates`) and multiplies by the number of nights. Swap in a real pricing
-  service later and this is the only class that changes.
+### Pricing
 
-* **Reservation ids.** They needed to survive being typed into a bank transfer reference by hand,
-  because that's literally where the confirmation comes from - the event's `transactionDescription`
-  carries an 8-character id at the end (`"...P4145478"`). `ReservationIdGenerator` produces a letter
-  plus 7 digits, skipping `I`, `O` and `0` so nobody misreads them off a screen or a receipt.
+The specification doesn't define room prices.
 
-* **The broken spec URL.** The OpenAPI spec I was given has a broken `servers.url` for
-  credit-card-payment-service (`http//:localhost:9090//host/...` - note the missing colon). I read it
-  as `http://localhost:9090/host/credit-card-payment-api` and wired that in as the default,
-  configurable via `room-reservation.credit-card-payment.base-url` if it ever needs to point somewhere
-  else.
+`RoomPricingCalculator` therefore reads the nightly rate for each `RoomSegment` from `application.yaml` (`room-reservation.nightly-rates`) and calculates the total based on the number of nights.
 
-* **Rejected credit card payments.** Taking the assignment at its word - "if credit payment is
-  confirmed, then confirm the room else throw an error" - a rejected payment shouldn't leave anything
-  behind. So it doesn't: nothing gets written to the database, and the room stays open for the next
-  guest instead of showing up cancelled.
+This keeps pricing isolated so it can later be replaced with a dedicated pricing service without changing the reservation flow.
 
-* **Double-booking.** Nobody asked for this protection outright, but a reservation system that hands
-  the same room to two guests for the same week isn't much of a reservation system.
-  `ReservationRepository.existsOverlapping` catches an overlapping room and date range with a `409`
-  before pricing runs or the credit card service gets called - no point burning a paid API call on a
-  request that's doomed anyway. Cancelling a reservation frees the room back up. That check alone
-  doesn't cover two requests landing at the exact same moment, though, so
-  `V2__prevent_room_overlap_at_the_database.sql` backs it up with a Postgres exclusion constraint on
-  `(room_number, daterange)` - the real guarantee, and `ReservationRepositoryIntegrationTest` proves it
-  against an actual database.
+### Reservation IDs
 
-* **Kafka idempotency.** Kafka guarantees at-least-once delivery, not exactly-once, so
-  `ProcessedPayment` keeps a record of every `paymentId` it's already handled. A redelivered event
-  just gets skipped rather than crediting the same payment twice. Bank transfers can also arrive as
-  several smaller payments instead of one lump sum, so `applyBankTransferPayment` adds each one to a
-  running balance and only confirms once that balance covers the full price.
+The reservation ID is also used as the bank transfer reference, so it needs to be easy to read and type manually.
 
-* **The cancellation window.** "2 days before the reservation start date" I took to mean: once you
-  cross that line, an unpaid bank-transfer booking is fair game for cancellation. The scheduler checks
-  hourly instead of once a day (`room-reservation.cancellation-check-cron`), so a booking doesn't sit
-  overdue for most of a day before anything notices. It also works through candidates in capped
-  batches (`CANCELLATION_BATCH_SIZE`) rather than pulling every overdue reservation into memory in one
-  go - and it always re-queries page 0, never an incrementing page number, since cancelling a batch
-  shrinks the result set and page 0 keeps landing on whatever's left.
+`ReservationIdGenerator` generates an 8-character ID consisting of one letter and seven digits. Ambiguous characters such as `I`, `O`, and `0` are excluded to reduce mistakes when copying the ID from a receipt or screen.
 
-* **Malformed Kafka messages.** A message that's malformed - a `transactionDescription` of the wrong
-  length, a missing `paymentId`, a zero or negative `amountReceived` - isn't going to start working if
-  you just retry it. `KafkaConsumerConfig` treats those as non-retryable, so the listener logs the bad
-  message and moves on instead of getting stuck reprocessing it forever.
+### Credit Card Service URL
 
-* **Cash payments.** These get confirmed without any payment record at all. The assignment only says
-  cash "must be confirmed immediately" - nothing about collecting money upfront the way bank transfer
-  and credit card do - so a cash reservation comes back `CONFIRMED` with `amountReceived` sitting at
-  zero, on the assumption the money actually changes hands at the front desk.
+The provided OpenAPI specification contains a malformed `servers.url` for the credit-card-payment-service:
+
+`http//:localhost:9090//host/...`
+
+I assumed the intended default URL is:
+
+`http://localhost:9090/host/credit-card-payment-api`
+
+The value is configurable through `room-reservation.credit-card-payment.base-url`, so the implementation doesn't depend on the local development URL.
+
+### Rejected Credit Card Payments
+
+A reservation is only created after the credit card payment has been successfully confirmed.
+
+If the payment is rejected, the request fails and no reservation is persisted. This also leaves the room available for another customer.
+
+### Double Booking
+
+The API performs an overlap check before pricing or calling the credit card service:
+
+`ReservationRepository.existsOverlapping(...)`
+
+If the room is already reserved for overlapping dates, the API returns `409 Conflict`.
+
+The application-level check avoids unnecessary external calls, but it isn't sufficient on its own for concurrent requests. Two requests could pass the check at the same time.
+
+For that reason, `V2__prevent_room_overlap_at_the_database.sql` adds a PostgreSQL exclusion constraint on the room number and date range. The database constraint is the final consistency guarantee.
+
+`ReservationRepositoryIntegrationTest` verifies the constraint against a real PostgreSQL database.
+
+Cancelling a reservation removes it from the active booking set, making the room available again.
+
+### Kafka Idempotency
+
+Kafka provides at-least-once delivery, so the same payment event can be delivered more than once.
+
+`ProcessedPayment` stores processed `paymentId`s. A duplicate event is ignored instead of applying the payment again.
+
+Bank transfers can also arrive as multiple transactions. `applyBankTransferPayment` accumulates the received amounts and confirms the reservation once the total covers the reservation price.
+
+### Cancellation
+
+I interpreted "2 days before the reservation start date" as the point after which an unpaid bank-transfer reservation becomes eligible for cancellation.
+
+The cancellation job runs hourly rather than daily, reducing the time an overdue reservation can remain active.
+
+Processing is done in batches using `CANCELLATION_BATCH_SIZE` to avoid loading a large number of reservations into memory.
+
+After each batch, the query starts again from page 0. This is intentional: cancelling records changes the result set, so incrementing the page number could cause records to be skipped.
+
+### Malformed Kafka Messages
+
+Invalid messages are treated as non-retryable.
+
+Examples include:
+
+* Missing `paymentId`
+* Invalid `transactionDescription`
+* `amountReceived <= 0`
+
+Retrying these messages won't make them valid, so `KafkaConsumerConfig` logs the problem and moves on instead of repeatedly processing the same message.
+
+### Cash Payments
+
+Cash reservations are confirmed immediately.
+
+No payment record is created and `amountReceived` remains zero. The assumption is that cash is collected at the front desk rather than during the reservation request.
+
+This follows the assignment's requirement that cash reservations are confirmed immediately, while bank-transfer and credit-card reservations require payment confirmation.
 
 ## Trade-offs & What I'd Change
 
