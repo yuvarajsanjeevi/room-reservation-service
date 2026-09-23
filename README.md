@@ -38,64 +38,63 @@ other: a payment landing right as the scheduler decides a booking is overdue.
 
 ## Design & Implementation Decisions
 
-The assignment leaves a fair amount up to the candidate. Here's what I went with and why.
+The assignment leaves a lot of gaps, so here's what I decided and why.
 
-**Pricing** isn't specified anywhere, so `RoomPricingCalculator` just multiplies a configurable
-nightly rate per `RoomSegment` (`room-reservation.nightly-rates` in `application.yaml`) by the number
-of nights. If a real pricing service shows up later, only that one class needs to change.
+Nothing in the spec says what a room costs, so I didn't overthink it - `RoomPricingCalculator` looks
+up a nightly rate per `RoomSegment` from `application.yaml` (`room-reservation.nightly-rates`) and
+multiplies by the number of nights. Swap in a real pricing service later and this is the only class
+that changes.
 
-**The reservation id** has to be something a customer can type into a bank transfer reference, since
-the event's `transactionDescription` has an 8-character id tucked inside it (`"...P4145478"`). So
-`ReservationIdGenerator` builds a letter followed by 7 digits and skips `I`, `O` and `0` - easy to
-read aloud or copy off a screen without mixing anything up.
+Reservation ids needed to survive being typed into a bank transfer reference by hand, because that's
+literally where the confirmation comes from - the event's `transactionDescription` carries an
+8-character id at the end (`"...P4145478"`). `ReservationIdGenerator` produces a letter plus 7 digits,
+skipping `I`, `O` and `0` so nobody misreads them off a screen or a receipt.
 
-The supplied OpenAPI spec's `servers.url` for credit-card-payment-service is broken
-(`http//:localhost:9090//host/...`), so `room-reservation.credit-card-payment.base-url` just uses the
-sensible reading of it instead: `http://localhost:9090/host/credit-card-payment-api`. You can override
-it per environment anyway.
+The OpenAPI spec I was given has a broken `servers.url` for credit-card-payment-service
+(`http//:localhost:9090//host/...` - note the missing colon). I read it as
+`http://localhost:9090/host/credit-card-payment-api` and wired that in as the default, configurable
+via `room-reservation.credit-card-payment.base-url` if it ever needs to point somewhere else.
 
-Reading the assignment literally - "if credit payment is confirmed, then confirm the room else throw
-an error" - a rejected payment creates nothing at all. It's never even saved, so the room stays
-available for the next guest instead of sitting cancelled and blocking it.
+Taking the assignment at its word - "if credit payment is confirmed, then confirm the room else throw
+an error" - a rejected credit card payment shouldn't leave anything behind. So it doesn't: nothing
+gets written to the database, and the room stays open for the next guest instead of showing up
+cancelled.
 
-Double-booking prevention isn't asked for explicitly, but a reservation service that lets two guests
-book the same room for the same week isn't really doing reservations. `ReservationRepository.existsOverlapping`
-rejects an overlapping room/date range with `409 Conflict`, checked before pricing or the credit card
-call runs - so a doomed request never has to wait on that call at all. Cancelled reservations free the
-room back up. That check alone can't stop two requests racing for the same room at the same
-instant, though - `V2__prevent_room_overlap_at_the_database.sql` adds a Postgres exclusion constraint
-on `(room_number, daterange)` as the real backstop, checked against a real database by
-`ReservationRepositoryIntegrationTest`.
+Nobody asked for double-booking protection outright, but a reservation system that hands the same
+room to two guests for the same week isn't much of a reservation system.
+`ReservationRepository.existsOverlapping` catches an overlapping room and date range with a `409`
+before pricing runs or the credit card service gets called - no point burning a paid API call on a
+request that's doomed anyway. Cancelling a reservation frees the room back up. That check alone
+doesn't cover two requests landing at the exact same moment, though, so
+`V2__prevent_room_overlap_at_the_database.sql` backs it up with a Postgres exclusion constraint on
+`(room_number, daterange)` - the real guarantee, and `ReservationRepositoryIntegrationTest` proves it
+against an actual database.
 
-Kafka delivers at-least-once, so `ProcessedPayment` records every `paymentId` once it's been applied -
-a redelivered event gets caught and skipped instead of double-crediting a reservation. Bank transfers
-can also show up as more than one payment, so `applyBankTransferPayment` just adds each one to the
-balance and confirms once the running total reaches the price.
+Kafka guarantees at-least-once delivery, not exactly-once, so `ProcessedPayment` keeps a record of
+every `paymentId` it's already handled. A redelivered event just gets skipped rather than crediting
+the same payment twice. Bank transfers can also arrive as several smaller payments instead of one
+lump sum, so `applyBankTransferPayment` adds each one to a running balance and only confirms once
+that balance covers the full price.
 
-For "2 days before the reservation start date," I took it as: from that point on, an unpaid
-bank-transfer reservation is fair game for cancellation. The scheduler runs hourly rather than daily
-(`room-reservation.cancellation-check-cron`), so nothing sits overdue for most of a day waiting on a
-once-a-day job. It also fetches candidates in capped batches (`CANCELLATION_BATCH_SIZE`) instead of
-loading every overdue reservation into memory at once. The trick is that it always asks for page 0,
-never an incrementing page number - cancelling a batch removes those rows from the query, so page 0
-keeps handing back whatever's still left until nothing is.
+"2 days before the reservation start date" I took to mean: once you cross that line, an unpaid
+bank-transfer booking is fair game for cancellation. The scheduler checks hourly instead of once a day
+(`room-reservation.cancellation-check-cron`), so a booking doesn't sit overdue for most of a day
+before anything notices. It also works through candidates in capped batches
+(`CANCELLATION_BATCH_SIZE`) rather than pulling every overdue reservation into memory in one go - and
+it always re-queries page 0, never an incrementing page number, since cancelling a batch shrinks the
+result set and page 0 keeps landing on whatever's left.
 
-A Kafka message that doesn't parse - a `transactionDescription` that's the wrong length, or a missing
-`paymentId`/non-positive `amountReceived` - is never going to succeed no matter how many times it's
-retried. `KafkaConsumerConfig` marks those exceptions non-retryable so the listener logs it and moves
-on instead of getting stuck on that record.
+A Kafka message that's malformed - a `transactionDescription` of the wrong length, a missing
+`paymentId`, a zero or negative `amountReceived` - isn't going to start working if you just retry it.
+`KafkaConsumerConfig` treats those as non-retryable, so the listener logs the bad message and moves on
+instead of getting stuck reprocessing it forever.
 
-Cash reservations get confirmed without recording a payment. The assignment just says cash "must be
-confirmed immediately," with nothing about collecting money up front the way bank transfer and credit
-card do - so a cash reservation is created `CONFIRMED` with `amountReceived` at zero, on the
-assumption the money changes hands at the property.
+Cash gets confirmed without any payment record at all. The assignment only says cash "must be
+confirmed immediately" - nothing about collecting money upfront the way bank transfer and credit card
+do - so a cash reservation comes back `CONFIRMED` with `amountReceived` sitting at zero, on the
+assumption the money actually changes hands at the front desk.
 
 ## Trade-offs & What I'd Change
-
-The JPA entity doubles as the domain model. For a service this size, a separate persistence DTO would
-just mirror the same fields back and forth, so I skipped it - the cost is `Reservation` carrying JPA
-annotations next to its actual behavior. I'd split them apart if the domain rules ever got a lot
-more complex.
 
 Nightly rates are static config, not a real pricing service - fine for what the assignment asks, but
 an actual deployment would call out to a rates/inventory system instead.
