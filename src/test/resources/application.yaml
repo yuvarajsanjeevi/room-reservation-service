@@ -1,0 +1,36 @@
+spring:
+  # Tests never need the real Postgres/Kafka containers Boot would otherwise try to start.
+  docker:
+    compose:
+      enabled: false
+
+  datasource:
+    url: jdbc:h2:mem:room-reservation-test;DB_CLOSE_DELAY=-1;MODE=PostgreSQL
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+
+  jpa:
+    hibernate:
+      # H2 stands in for Postgres here, so Hibernate generates the schema from the entities directly
+      # rather than validating against the (Postgres-specific) Flyway migration.
+      ddl-auto: create-drop
+  flyway:
+    enabled: false
+
+room-reservation:
+  nightly-rates:
+    SMALL: 80
+    MEDIUM: 120
+    LARGE: 160
+    EXTRA_LARGE: 220
+  cancellation-check-cron: "0 0 * * * *"
+  credit-card-payment:
+    base-url: http://localhost:9090/host/credit-card-payment-api
+    max-retries: 0
+    retry-delay: 10ms
+    retry-max-delay: 10ms
+
+logging:
+  level:
+    com.example.reservation: DEBUG

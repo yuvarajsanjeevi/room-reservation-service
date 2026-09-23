@@ -1,0 +1,221 @@
+openapi: 3.1.0
+info:
+  title: Room Reservation Service
+  description: "Marvel Hospitality - confirms and tracks room reservations across\
+    \ cash, credit card and bank transfer payments."
+  version: 1.0.0
+servers:
+- url: /
+tags:
+- name: Reservations
+  description: Confirm and look up room reservations
+paths:
+  /api/v1/reservations:
+    post:
+      tags:
+      - Reservations
+      summary: Confirm a room reservation
+      description: "Cash confirms immediately. Credit card is confirmed only if credit-card-payment-service\
+        \ reports the referenced payment as CONFIRMED, otherwise the request fails\
+        \ and no room is reserved. Bank transfer is booked with status PENDING_PAYMENT\
+        \ until a matching bank-transfer-payment-update event fully pays it, or it\
+        \ is auto-cancelled 2 days before the reservation start date if it never is."
+      operationId: confirmReservation
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReservationRequest"
+        required: true
+      responses:
+        "201":
+          description: "The reservation was created, confirmed or left pending payment\
+            \ per its payment mode"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReservationResponse"
+        "400":
+          description: "A missing or malformed field, or a stay longer than 30 days"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+              example:
+                type: https://example.com/room-reservation-service/errors/invalid-request
+                title: Invalid request
+                status: 400
+                detail: "A room cannot be reserved for more than 30 days, but 45 were\
+                  \ requested."
+                instance: /api/v1/reservations
+        "409":
+          description: The room is already reserved for an overlapping date range
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+              example:
+                type: https://example.com/room-reservation-service/errors/room-unavailable
+                title: Room unavailable
+                status: 409
+                detail: Room 204 is already reserved between 2026-10-01 and 2026-10-05.
+                instance: /api/v1/reservations
+        "422":
+          description: "Credit card payment mode, and the referenced payment was not\
+            \ confirmed"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+              example:
+                type: https://example.com/room-reservation-service/errors/payment-rejected
+                title: Payment rejected
+                status: 422
+                detail: "Credit card payment for reference 'DL123456789' is REJECTED,\
+                  \ not CONFIRMED."
+                instance: /api/v1/reservations
+        "502":
+          description: "credit-card-payment-service could not be reached, or kept\
+            \ failing after retries"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+              example:
+                type: https://example.com/room-reservation-service/errors/upstream-unavailable
+                title: Payment service unavailable
+                status: 502
+                detail: credit-card-payment-service returned 503 SERVICE_UNAVAILABLE.
+                instance: /api/v1/reservations
+        "500":
+          description: Unexpected internal error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+              example:
+                type: https://example.com/room-reservation-service/errors/internal-error
+                title: Internal error
+                status: 500
+                detail: The request could not be completed.
+                instance: /api/v1/reservations
+  /api/v1/reservations/{reservationId}:
+    get:
+      tags:
+      - Reservations
+      summary: Look up a reservation by id
+      operationId: getReservation
+      parameters:
+      - name: reservationId
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        "200":
+          description: The reservation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReservationResponse"
+        "404":
+          description: No reservation exists with that id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+              example:
+                type: https://example.com/room-reservation-service/errors/reservation-not-found
+                title: Reservation not found
+                status: 404
+                detail: No reservation found with id 'P4145478'.
+                instance: /api/v1/reservations/P4145478
+        "500":
+          description: Unexpected internal error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+              example:
+                type: https://example.com/room-reservation-service/errors/internal-error
+                title: Internal error
+                status: 500
+                detail: The request could not be completed.
+                instance: /api/v1/reservations/P4145478
+components:
+  schemas:
+    ReservationRequest:
+      type: object
+      properties:
+        customerName:
+          type: string
+          example: Jane Doe
+          minLength: 1
+        roomNumber:
+          type: string
+          example: "204"
+          minLength: 1
+        reservationStartDate:
+          type: string
+          format: date
+          example: 2026-10-01
+        reservationEndDate:
+          type: string
+          format: date
+          example: 2026-10-05
+        roomSegment:
+          type: string
+          enum:
+          - SMALL
+          - MEDIUM
+          - LARGE
+          - EXTRA_LARGE
+        paymentMode:
+          type: string
+          enum:
+          - CASH
+          - CREDIT_CARD
+          - BANK_TRANSFER
+        paymentReference:
+          type: string
+          example: DL123456789
+      required:
+      - customerName
+      - paymentMode
+      - reservationEndDate
+      - reservationStartDate
+      - roomNumber
+      - roomSegment
+    ReservationResponse:
+      type: object
+      properties:
+        reservationId:
+          type: string
+        reservationStatus:
+          type: string
+          enum:
+          - PENDING_PAYMENT
+          - CONFIRMED
+          - CANCELLED
+    ApiError:
+      type: object
+      description: The body of every error response
+      properties:
+        type:
+          type: string
+          format: uri
+          example: https://example.com/room-reservation-service/errors/room-unavailable
+        title:
+          type: string
+          example: Room unavailable
+        status:
+          type: integer
+          format: int32
+          example: 409
+        detail:
+          type: string
+          example: Room 204 is already reserved between 2026-10-01 and 2026-10-05.
+        instance:
+          type: string
+          format: uri
+          example: /api/v1/reservations

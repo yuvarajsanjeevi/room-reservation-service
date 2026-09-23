@@ -1,0 +1,86 @@
+spring:
+  application:
+    name: room-reservation-service
+
+  # Starts Postgres + Kafka from docker-compose.yaml on `spring-boot:run` and stops them afterwards, so
+  # a fresh clone needs Docker but no setup. Boot discovers the datasource URL and bootstrap-servers
+  # itself from the running containers, which is why neither is set explicitly below.
+  docker:
+    compose:
+      enabled: true
+      lifecycle-management: start-and-stop
+
+  jpa:
+    # Flyway owns the schema; Hibernate only checks it matches, it never writes DDL itself.
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+
+  kafka:
+    consumer:
+      group-id: room-reservation-service
+      # A payment update must never be silently skipped, so a brand new consumer group starts from
+      # the beginning of the topic rather than only seeing messages published after it first connects.
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # JacksonJsonDeserializer, not the deprecated JsonDeserializer - this service is on Jackson 3.
+      value-deserializer: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
+      properties:
+        spring.json.trusted.packages: com.example.reservation.messaging
+        spring.json.value.default.type: com.example.reservation.messaging.BankTransferPaymentUpdateEvent
+        # The event producer is another team's service and will not set our Java type as a header.
+        spring.json.use.type.headers: false
+
+  # Applied to the auto-configured RestClient.Builder used for credit-card-payment-service. Without
+  # these a stuck call on the far side would hold a request thread forever.
+  http:
+    clients:
+      connect-timeout: 2s
+      read-timeout: 5s
+
+  threads:
+    virtual:
+      enabled: true
+
+  # Error details come from ApiExceptionHandler, so the default error page must not leak a message of its own.
+  web:
+    error:
+      include-message: never
+
+room-reservation:
+  # The assignment specifies no pricing model; nightly rates per room segment, in the local currency.
+  nightly-rates:
+    SMALL: 80
+    MEDIUM: 120
+    LARGE: 160
+    EXTRA_LARGE: 220
+  # Spring cron (second minute hour day month weekday): every hour, on the hour. Frequent enough that
+  # a reservation is never more than an hour late to be cancelled once its 2-day lead time is up.
+  cancellation-check-cron: "0 0 * * * *"
+  credit-card-payment:
+    # The assignment's OpenAPI spec has a malformed "servers.url" - this is the sane reading of it.
+    base-url: http://localhost:9090/host/credit-card-payment-api
+    max-retries: 2
+    retry-delay: 200ms
+    retry-max-delay: 2s
+
+server:
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: method
+
+logging:
+  level:
+    com.example.reservation: INFO
