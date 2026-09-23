@@ -21,7 +21,7 @@ reservations across three payment modes and keeps bank-transfer bookings honest 
 
 ## Why I Built It This Way
 
-The three payment branches are the easy part - basically an `if/else`. What actually took thought was
+The three payment branches are the easy part - basically a `switch`. What actually took thought was
 everything that happens *after* a reservation exists: a bank transfer can come in as more than one
 payment, Kafka can redeliver the same event, and a booking can sit unpaid while nothing is watching it
 until the scheduler happens to run.
